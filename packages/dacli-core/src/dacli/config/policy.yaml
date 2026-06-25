@@ -1,0 +1,120 @@
+# DACLI governance policy.
+#
+# Maps blast-radius tiers to enforcement decisions. This file lets a team tune
+# velocity vs. caution per connector / environment WITHOUT code changes. Absent
+# any override, the locked posture applies:
+#
+#   safe         -> auto             (run immediately)
+#   write        -> verify           (run + mandatory post-condition)
+#   risky        -> confirm          (human confirm + rollback plan)
+#   irreversible -> dry_run+approve  (dry-run + verified rollback + approval)
+#
+# Resolution is most-specific-wins:
+#   connectors.<id>.environments.<env>  >  connectors.<id>.tiers  >  defaults
+#
+# Valid decisions: auto | verify | confirm | dry_run+approve
+
+# Global tier -> decision overrides (apply to every connector unless a more
+# specific rule below matches). Leave empty to keep the locked posture.
+defaults: {}
+
+# Identifier tokens that mark an action's target as production. A prod target
+# promotes the classifier tier one step (write->risky, risky->irreversible).
+prod_markers:
+  - PROD
+  - PRODUCTION
+  - GOLD
+  - PRD
+
+# Least-privilege scope per connector (the connection-profile opt-in). The code
+# default is `read_only` (an action above the scope is refused even if the model
+# asks). Widen here to enable writes/destructive ops:
+#   read_only -> safe only | write -> +create/insert | risky -> +update/delete |
+#   admin -> +drop/truncate. Tighten any connector to read_only to make it
+#   strictly observe-only.
+connectors:
+  snowflake:
+    scope: admin          # full SQL; set to read_only to make Snowflake observe-only
+    # Connector-wide rules (any environment).
+    tiers: {}
+    environments:
+      # Example: a dev warehouse is low-stakes — let writes through without a
+      # post-condition gate, but still confirm genuinely risky DML.
+      dev:
+        write: auto
+      # Production stays strict (this is the default, shown for clarity).
+      prod:
+        write: verify
+        risky: confirm
+        irreversible: dry_run+approve
+
+  github:
+    scope: admin          # allows push + delete; set to write to forbid deletes
+    tiers: {}
+    environments: {}
+
+  # --- Era 2: the governed shell tier --------------------------------------
+  # The shell tier (run_shell_command) flows through this SAME policy table: the
+  # *command* is blast-radius-classified (an `ls` is safe; `rm -rf` / `git push
+  # --force` are irreversible and refused for want of a verifiable undo). Its
+  # least-privilege ceiling is set by `terminal.scope` in settings (default
+  # 'write'), which is authoritative over any `scope:` here. The tiers/
+  # environments overrides below still apply — e.g. require approval for every
+  # shell write, or auto-run writes on a throwaway box.
+  shell:
+    tiers: {}             # e.g. {write: confirm} to gate even mkdir/touch
+    environments: {}
+
+  # --- Wave 1 platforms ---------------------------------------------
+  # All ship read-only (the code default). Widen the grant per deployment:
+  #   write -> +create/insert/put | risky -> +update/delete | admin -> +drop.
+  # A platform left at read_only is strictly observe-only even if the model asks
+  # to write — the capability simply isn't there to misuse.
+  dbt:
+    scope: read_only      # widen to `risky` to allow `dbt run` / `dbt build`
+    tiers: {}
+    environments: {}
+  bigquery:
+    scope: read_only      # native dry_run gives an exact cost/effect preview first
+    tiers: {}
+    environments: {}
+  databricks:
+    scope: read_only      # Delta time travel backs RESTORE-based rollback
+    tiers: {}
+    environments: {}
+  s3:
+    scope: read_only      # enable bucket versioning before granting delete (admin)
+    tiers: {}
+    environments: {}
+  gcs:
+    scope: read_only      # enable object versioning before granting delete (admin)
+    tiers: {}
+    environments: {}
+
+  # --- Wave 2 operational databases ---------------------------------
+  postgres:
+    scope: read_only      # fully transactional — BEGIN/ROLLBACK is a true undo
+    tiers: {}
+    environments: {}
+  mysql:
+    scope: read_only      # DML transactional (InnoDB); DDL needs mysqldump snapshots
+    tiers: {}
+    environments: {}
+  mongodb:
+    scope: read_only      # no native undo — deletes rely on mongodump copy-aside
+    tiers: {}
+    environments: {}
+  dynamodb:
+    scope: read_only      # enable PITR before granting destructive ops (admin)
+    tiers: {}
+    environments: {}
+
+  # --- Wave 3 orchestration ---------------------------------------------------
+  airflow:
+    scope: read_only      # grant `risky` to trigger/pause; delete is gated hard
+    tiers: {}
+    environments: {}
+  dagster:
+    scope: read_only      # grant `risky` to launch runs
+    tiers: {}
+    environments: {}

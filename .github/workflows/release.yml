@@ -1,0 +1,149 @@
+name: Release
+
+# Cut a release by pushing a version tag:
+#
+#     python tools/bump_version.py 0.2.0   # bumps all four wheels in lockstep
+#     git commit -am "release: v0.2.0"
+#     git tag v0.2.0 && git push --follow-tags
+#
+# The tag (vX.Y.Z) must match every wheel's __version__ — the gate below fails
+# loudly on drift so a mis-tagged build never ships. On a clean run this:
+#   1. re-runs the CI gate (lint + tests + DoD + docs + eval + headless smoke),
+#   2. builds the sdist + wheel for all four packages,
+#   3. creates a GitHub Release with auto-generated notes and the artifacts,
+#   4. publishes to PyPI via trusted publishing (OIDC — no API token).
+#
+# One-time PyPI setup is documented in RELEASING.md.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  # Gate + build in one job so the artifacts that ship are the exact ones the
+  # full test suite passed against. Mirrors .github/workflows/ci.yml's test job,
+  # plus a tag/version-agreement guard.
+  build:
+    name: Gate and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # full history so release notes can diff against the last tag
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install --no-deps \
+            -e packages/dacli-ai -e packages/dacli-core \
+            -e packages/dacli-tui -e packages/dacli
+          pip install build
+
+      # Fail fast if the tag and the packaged versions disagree — a mis-tagged
+      # release is worse than no release. The four wheels (M13) release in lockstep,
+      # so all four versions must equal the tag.
+      - name: Verify tag matches all package versions
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          python - "$TAG" <<'PY'
+          import sys
+          import dacli.ai, dacli.core, dacli.tui, dacli.scripts
+          tag = sys.argv[1]
+          versions = {
+              "dacli-ai": dacli.ai.__version__,
+              "dacli-core": dacli.core.__version__,
+              "dacli-tui": dacli.tui.__version__,
+              "dacli": dacli.scripts.__version__,
+          }
+          print("tag=%s versions=%s" % (tag, versions))
+          bad = {k: v for k, v in versions.items() if v != tag}
+          if bad:
+              print("::error::tag %s disagrees with %s" % (tag, bad))
+              sys.exit(1)
+          PY
+
+      - name: ruff check
+        run: pip install ruff==0.15.16 && ruff check .
+
+      - name: Connector Definition-of-Done gate
+        run: python -m unittest tests.test_connector_dod -v
+
+      - name: Full test suite
+        run: pytest tests/ -q
+
+      - name: Docs drift gate
+        run: python tools/check_docs.py
+
+      - name: Reliability eval (sim suite, pass^k)
+        run: python -m dacli.eval --quick
+
+      - name: Headless e2e smoke (scripted LLM, offline)
+        run: python run.py replay scenarios/smoke_headless.json --json
+
+      - name: Build sdist and wheel for all four packages
+        run: |
+          for pkg in dacli-ai dacli-core dacli-tui dacli; do
+            python -m build "packages/$pkg" --outdir dist
+          done
+
+      - name: Check artifact metadata
+        run: pip install twine && twine check dist/*
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the release + upload assets
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true   # auto changelog from merged PRs since the last tag
+          files: dist/*
+          fail_on_unmatched_files: true
+
+  pypi-publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # The `pypi` environment is where the trusted-publisher link is configured on
+    # pypi.org and where you can require a manual approval before a publish.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/dacli/
+    permissions:
+      id-token: write   # OIDC token for trusted publishing — no API token/secret
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

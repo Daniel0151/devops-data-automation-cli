@@ -1,0 +1,91 @@
+name: CI
+
+# The DoD gate is mechanical, not a vibe (the roadmap §"Definition of Done"): every
+# connector must ship its post-conditions, rollback strategy, permission scope,
+# introspection op, SKILL.md, and a golden task, or the build fails. This is the
+# structural cure for governance debt — capability (𝒮) and governance (𝒢) scale
+# together or not at all.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Lint is its own job so a style/correctness regression is a named, fast failure
+  # independent of the test matrix. Pinned ruff version keeps the baseline (P09)
+  # from drifting under us when a new ruff release adds rules.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install ruff + vulture
+        run: pip install ruff==0.15.16 "vulture>=2,<3"
+      - name: ruff check
+        run: ruff check .
+      # Dead-code gate at confidence 80 (P10): below that, dynamic dispatch
+      # (pydantic fields, registry-loaded connectors, op-/command-dispatch) is
+      # all false positives. The whitelist records the genuine ones.
+      - name: vulture (dead code)
+        run: vulture packages .vulture_whitelist.py --min-confidence 80
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Reproducible: install the exact pinned closure (base + all extras +
+          # dev tooling) from the lockfile (P11), then the working tree itself
+          # with --no-deps so the lock stays authoritative for versions.
+          pip install -r requirements.lock
+          # Editable-install the four wheels (M13) with --no-deps so the lock stays
+          # authoritative for third-party versions.
+          pip install --no-deps \
+            -e packages/dacli-ai -e packages/dacli-core \
+            -e packages/dacli-tui -e packages/dacli
+
+      # Run the DoD gate first and on its own so a governance-debt regression is
+      # an unmistakable, named failure rather than buried in the suite.
+      - name: Connector Definition-of-Done gate
+        run: python -m unittest tests.test_connector_dod -v
+
+      # Use pytest, not `unittest discover`: the latter silently skips bare
+      # `def test_*` functions (all of tests/test_tui.py), so the TUI suite never
+      # ran in CI and a regression merged green. pytest collects every test.
+      - name: Full test suite
+        run: pytest tests/ -q
+
+      # Docs drift gate (P12/D-7): the README's tests badge, eval sample, and
+      # command reference once rotted ("200 passing" vs a 368-test suite).
+      # Enforce them against the working tree so they can't go stale again.
+      - name: Docs drift gate
+        run: python tools/check_docs.py
+
+      # Prove reliability, don't assert it: run the offline pass^k golden suite
+      # against the simulated platforms on every PR. Fails loudly on an unguarded
+      # destructive execution (the DROP-guard must hold across k runs).
+      - name: Reliability eval (sim suite, pass^k)
+        run: python -m dacli.eval --quick
+
+      # End-to-end smoke of the headless agent surface: drives the real agent
+      # loop + governance with a scripted (offline, free) LLM and asserts the
+      # JSON contract holds and the process exits 0. No secrets required.
+      - name: Headless e2e smoke (scripted LLM, offline)
+        run: python run.py replay scenarios/smoke_headless.json --json
